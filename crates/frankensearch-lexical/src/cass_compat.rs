@@ -6,10 +6,12 @@ use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::error::{SearchError, SearchResult};
+use jieba_rs::{Jieba, TokenizeMode};
 use tantivy::SegmentMeta;
 use tantivy::indexer::{LogMergePolicy, MergeCandidate, MergePolicy, NoMergePolicy, UserOperation};
 use tantivy::query::{
-    AllQuery, BooleanQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
+    AllQuery, BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery,
+    TermQuery,
 };
 use tantivy::schema::IndexRecordOption;
 use tantivy::schema::{
@@ -40,10 +42,9 @@ impl MergePolicy for ArcMergePolicy {
 }
 
 /// Schema version namespace used for cass-compatible Tantivy indexes.
-pub const CASS_SCHEMA_VERSION: &str = "v8";
+pub const CASS_SCHEMA_VERSION: &str = "v9";
 /// Content hash used to detect schema/tokenizer changes that require rebuild.
-pub const CASS_SCHEMA_HASH: &str =
-    "tantivy-schema-v8-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external";
+pub const CASS_SCHEMA_HASH: &str = "tantivy-schema-v9-hyphen-cjk-bigrams-jieba-boosted-bounded-content-prefix-preview-stored-content-external";
 
 /// Specialized tokenizer for cass lexical fields.
 ///
@@ -422,6 +423,91 @@ impl<T: TokenStream> TokenStream for CjkBigramDecomposeStream<'_, T> {
     }
 }
 
+// ─── Jieba search-mode tokenizer ────────────────────────────────────────────
+//
+// This is an additive Chinese word-field analyzer. The existing CJK bigram
+// fields keep recall and substring behavior; Jieba word fields provide more
+// meaningful BM25 term statistics for Chinese ranking.
+
+static CASS_JIEBA: OnceLock<Jieba> = OnceLock::new();
+
+fn cass_jieba() -> &'static Jieba {
+    CASS_JIEBA.get_or_init(Jieba::new)
+}
+
+#[inline]
+fn cass_jieba_token_is_indexable(text: &str) -> bool {
+    text.chars().any(char::is_alphanumeric)
+}
+
+#[derive(Clone, Default)]
+struct JiebaSearchTokenizer {
+    token: Token,
+}
+
+struct JiebaSearchToken {
+    text: String,
+    offset_from: usize,
+    offset_to: usize,
+    position: usize,
+}
+
+struct JiebaSearchTokenStream<'a> {
+    tokens: Vec<JiebaSearchToken>,
+    cursor: usize,
+    token: &'a mut Token,
+}
+
+impl Tokenizer for JiebaSearchTokenizer {
+    type TokenStream<'a> = JiebaSearchTokenStream<'a>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        self.token.reset();
+        let tokens = cass_jieba()
+            .tokenize(text, TokenizeMode::Search, true)
+            .into_iter()
+            .filter(|token| cass_jieba_token_is_indexable(token.word))
+            .enumerate()
+            .map(|(position, token)| JiebaSearchToken {
+                text: token.word.to_owned(),
+                offset_from: token.byte_start,
+                offset_to: token.byte_end,
+                position,
+            })
+            .collect();
+        JiebaSearchTokenStream {
+            tokens,
+            cursor: 0,
+            token: &mut self.token,
+        }
+    }
+}
+
+impl TokenStream for JiebaSearchTokenStream<'_> {
+    fn advance(&mut self) -> bool {
+        let Some(next) = self.tokens.get(self.cursor) else {
+            return false;
+        };
+        self.cursor += 1;
+
+        self.token.text.clear();
+        self.token.text.push_str(&next.text);
+        self.token.offset_from = next.offset_from;
+        self.token.offset_to = next.offset_to;
+        self.token.position = next.position;
+        self.token.position_length = 1;
+        true
+    }
+
+    fn token(&self) -> &Token {
+        self.token
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        self.token
+    }
+}
+
 /// A cass-specific normalization filter that preserves the behavior of
 /// `LowerCaser + RemoveLongFilter::limit(256)` for the restricted token
 /// language emitted by `CassTokenizer`.
@@ -595,6 +681,8 @@ pub struct CassFields {
     pub created_at: Field,
     pub title: Field,
     pub content: Field,
+    pub title_zh_words: Field,
+    pub content_zh_words: Field,
     pub title_prefix: Field,
     pub content_prefix: Field,
     pub preview: Field,
@@ -1220,6 +1308,7 @@ fn build_cass_tantivy_document(
         fields.source_path => cass_doc.source_path.clone(),
         fields.msg_idx => cass_doc.msg_idx,
         fields.content => cass_doc.content.clone(),
+        fields.content_zh_words => cass_doc.content.clone(),
         fields.source_id => cass_doc.source_id.clone(),
         fields.origin_kind => cass_doc.origin_kind.clone(),
     };
@@ -1245,6 +1334,7 @@ fn build_cass_tantivy_document(
     }
     if let Some(title) = &cass_doc.title {
         d.add_text(fields.title, title);
+        d.add_text(fields.title_zh_words, title);
         d.add_text(fields.title_prefix, cass_generate_edge_ngrams(title));
     }
     let (content_prefix, preview) = cass_build_content_prefix_and_preview(&cass_doc.content);
@@ -1262,6 +1352,7 @@ fn build_cass_tantivy_document_ref(
         fields.source_path => cass_doc.source_path,
         fields.msg_idx => cass_doc.msg_idx,
         fields.content => cass_doc.content,
+        fields.content_zh_words => cass_doc.content,
         fields.source_id => cass_doc.source_id,
         fields.origin_kind => cass_doc.origin_kind,
     };
@@ -1287,6 +1378,7 @@ fn build_cass_tantivy_document_ref(
     }
     if let Some(title) = cass_doc.title {
         d.add_text(fields.title, title);
+        d.add_text(fields.title_zh_words, title);
         d.add_text(fields.title_prefix, cass_generate_edge_ngrams(title));
     }
     let (content_prefix, preview) = cass_build_content_prefix_and_preview(cass_doc.content);
@@ -1310,6 +1402,11 @@ pub fn cass_build_schema() -> Schema {
             .set_tokenizer("prefix_normalize")
             .set_index_option(tantivy::schema::IndexRecordOption::Basic),
     );
+    let zh_word_text = TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer("jieba_search")
+            .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions),
+    );
 
     schema_builder.add_text_field("agent", STRING | STORED);
     schema_builder.add_text_field("workspace", STRING | STORED);
@@ -1319,6 +1416,8 @@ pub fn cass_build_schema() -> Schema {
     schema_builder.add_i64_field("created_at", INDEXED | STORED | FAST);
     schema_builder.add_text_field("title", stored_indexed_text);
     schema_builder.add_text_field("content", indexed_text);
+    schema_builder.add_text_field("title_zh_words", zh_word_text.clone());
+    schema_builder.add_text_field("content_zh_words", zh_word_text);
     schema_builder.add_text_field("title_prefix", prefix_text.clone());
     schema_builder.add_text_field("content_prefix", prefix_text);
     schema_builder.add_text_field("preview", STORED);
@@ -1354,6 +1453,8 @@ pub fn cass_fields_from_schema(schema: &Schema) -> SearchResult<CassFields> {
         created_at: get("created_at")?,
         title: get("title")?,
         content: get("content")?,
+        title_zh_words: get("title_zh_words")?,
+        content_zh_words: get("content_zh_words")?,
         title_prefix: get("title_prefix")?,
         content_prefix: get("content_prefix")?,
         preview: get("preview")?,
@@ -1437,6 +1538,10 @@ pub fn cass_ensure_tokenizer(index: &mut Index) {
     index
         .tokenizers()
         .register("prefix_normalize", prefix_analyzer);
+    let jieba_analyzer = TextAnalyzer::builder(JiebaSearchTokenizer::default())
+        .filter(CassNormalizeAndLimit)
+        .build();
+    index.tokenizers().register("jieba_search", jieba_analyzer);
 }
 
 fn cass_push_prefix_term(out: &mut String, term: &str) {
@@ -1884,6 +1989,79 @@ fn cjk_bigrams(s: &str) -> Vec<String> {
         .collect()
 }
 
+const CASS_JIEBA_TITLE_BOOST: f32 = 2.0;
+const CASS_JIEBA_CONTENT_BOOST: f32 = 1.4;
+
+fn cass_normalize_jieba_query_term(term: &str) -> Option<String> {
+    if term.is_empty() || term.len() > 256 || !cass_jieba_token_is_indexable(term) {
+        return None;
+    }
+    let mut normalized = term.to_owned();
+    normalized.make_ascii_lowercase();
+    Some(normalized)
+}
+
+fn cass_jieba_query_terms(term: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in cass_jieba().tokenize(term, TokenizeMode::Default, true) {
+        if let Some(normalized) = cass_normalize_jieba_query_term(token.word)
+            && !out.contains(&normalized)
+        {
+            out.push(normalized);
+        }
+    }
+
+    if out.is_empty()
+        && let Some(normalized) = cass_normalize_jieba_query_term(term)
+    {
+        out.push(normalized);
+    }
+
+    out
+}
+
+fn cass_build_jieba_field_query(field: Field, term: &str, boost: f32) -> Box<dyn Query> {
+    Box::new(BoostQuery::new(
+        Box::new(TermQuery::new(
+            Term::from_field_text(field, term),
+            IndexRecordOption::WithFreqsAndPositions,
+        )),
+        boost,
+    ))
+}
+
+fn cass_build_jieba_term_query(term: &str, fields: &CassFields) -> Option<Box<dyn Query>> {
+    let terms = cass_jieba_query_terms(term);
+    if terms.is_empty() {
+        return None;
+    }
+
+    let mut word_musts: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(terms.len());
+    for term in terms {
+        let field_shoulds: Vec<(Occur, Box<dyn Query>)> = vec![
+            (
+                Occur::Should,
+                cass_build_jieba_field_query(fields.title_zh_words, &term, CASS_JIEBA_TITLE_BOOST),
+            ),
+            (
+                Occur::Should,
+                cass_build_jieba_field_query(
+                    fields.content_zh_words,
+                    &term,
+                    CASS_JIEBA_CONTENT_BOOST,
+                ),
+            ),
+        ];
+        word_musts.push((Occur::Must, Box::new(BooleanQuery::new(field_shoulds))));
+    }
+
+    match word_musts.len() {
+        0 => None,
+        1 => word_musts.pop().map(|(_, q)| q),
+        _ => Some(Box::new(BooleanQuery::new(word_musts))),
+    }
+}
+
 /// Build a query that requires ALL bigrams to match in at least one field.
 /// This mirrors how the tokenizer indexes CJK text.
 #[inline]
@@ -1940,6 +2118,9 @@ fn cass_build_term_query_clauses(
             if contains_cjk(term) {
                 let bigrams = cjk_bigrams(term);
                 if let Some(q) = cass_build_cjk_term_query(&bigrams, fields) {
+                    shoulds.push((Occur::Should, q));
+                }
+                if let Some(q) = cass_build_jieba_term_query(term, fields) {
                     shoulds.push((Occur::Should, q));
                 }
                 return shoulds;
@@ -2359,6 +2540,70 @@ mod cass_query_tests {
                 "prefix field should use the cheaper generated-prefix analyzer"
             );
         }
+    }
+
+    #[test]
+    fn cass_jieba_fields_are_indexed_not_stored() {
+        let schema = cass_build_schema();
+
+        for field_name in ["title_zh_words", "content_zh_words"] {
+            let field = schema.get_field(field_name).unwrap();
+            let field_entry = schema.get_field_entry(field);
+            assert!(
+                !field_entry.is_stored(),
+                "{field_name} should not duplicate stored payload"
+            );
+            assert_eq!(
+                field_entry.field_type().get_index_record_option(),
+                Some(IndexRecordOption::WithFreqsAndPositions),
+                "{field_name} should keep BM25 frequencies and positions"
+            );
+            let tantivy::schema::FieldType::Str(text_options) = field_entry.field_type() else {
+                panic!("{field_name} should be a text field");
+            };
+            assert_eq!(
+                text_options
+                    .get_indexing_options()
+                    .expect("jieba field indexing options")
+                    .tokenizer(),
+                "jieba_search",
+                "{field_name} should use the jieba analyzer"
+            );
+        }
+    }
+
+    #[test]
+    fn cass_jieba_search_tokenizer_emits_chinese_words() {
+        let mut analyzer = TextAnalyzer::builder(JiebaSearchTokenizer::default())
+            .filter(CassNormalizeAndLimit)
+            .build();
+        let mut stream = analyzer.token_stream("小明硕士毕业于中国科学院计算所");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+
+        assert!(
+            tokens.iter().any(|token| token == "中国科学院"),
+            "search-mode jieba tokens should include dictionary words: {tokens:?}"
+        );
+        assert!(
+            tokens.iter().any(|token| token == "计算所"),
+            "search-mode jieba tokens should include searchable subwords: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn cass_cjk_term_query_keeps_bigram_recall_and_adds_jieba_overlay() {
+        let fields = fields();
+        let pattern = CassWildcardPattern::Exact("中国科学院".to_string());
+        let clauses = cass_build_term_query_clauses(&pattern, &fields);
+
+        assert_eq!(
+            clauses.len(),
+            2,
+            "CJK terms should include the existing bigram query plus jieba scoring overlay"
+        );
     }
 
     #[test]

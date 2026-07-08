@@ -118,6 +118,7 @@ ft-core = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c3
 
 # Full-text search
 tantivy = "0.26.1"
+jieba-rs = "0.10.2"
 
 ndarray = "0.17"
 
