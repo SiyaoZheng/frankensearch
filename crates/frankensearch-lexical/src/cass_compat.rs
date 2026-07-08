@@ -1308,11 +1308,13 @@ fn build_cass_tantivy_document(
         fields.source_path => cass_doc.source_path.clone(),
         fields.msg_idx => cass_doc.msg_idx,
         fields.content => cass_doc.content.clone(),
-        fields.content_zh_words => cass_doc.content.clone(),
         fields.source_id => cass_doc.source_id.clone(),
         fields.origin_kind => cass_doc.origin_kind.clone(),
     };
 
+    if contains_cjk(&cass_doc.content) {
+        d.add_text(fields.content_zh_words, &cass_doc.content);
+    }
     if let Some(host) = &cass_doc.origin_host
         && !host.is_empty()
     {
@@ -1334,7 +1336,9 @@ fn build_cass_tantivy_document(
     }
     if let Some(title) = &cass_doc.title {
         d.add_text(fields.title, title);
-        d.add_text(fields.title_zh_words, title);
+        if contains_cjk(title) {
+            d.add_text(fields.title_zh_words, title);
+        }
         d.add_text(fields.title_prefix, cass_generate_edge_ngrams(title));
     }
     let (content_prefix, preview) = cass_build_content_prefix_and_preview(&cass_doc.content);
@@ -1352,11 +1356,13 @@ fn build_cass_tantivy_document_ref(
         fields.source_path => cass_doc.source_path,
         fields.msg_idx => cass_doc.msg_idx,
         fields.content => cass_doc.content,
-        fields.content_zh_words => cass_doc.content,
         fields.source_id => cass_doc.source_id,
         fields.origin_kind => cass_doc.origin_kind,
     };
 
+    if contains_cjk(cass_doc.content) {
+        d.add_text(fields.content_zh_words, cass_doc.content);
+    }
     if let Some(host) = cass_doc.origin_host
         && !host.is_empty()
     {
@@ -1378,7 +1384,9 @@ fn build_cass_tantivy_document_ref(
     }
     if let Some(title) = cass_doc.title {
         d.add_text(fields.title, title);
-        d.add_text(fields.title_zh_words, title);
+        if contains_cjk(title) {
+            d.add_text(fields.title_zh_words, title);
+        }
         d.add_text(fields.title_prefix, cass_generate_edge_ngrams(title));
     }
     let (content_prefix, preview) = cass_build_content_prefix_and_preview(cass_doc.content);
@@ -2570,6 +2578,36 @@ mod cass_query_tests {
                 "{field_name} should use the jieba analyzer"
             );
         }
+    }
+
+    #[test]
+    fn cass_jieba_fields_are_only_populated_for_cjk_text() {
+        let fields = fields();
+        let doc = |title: Option<&str>, content: &str| CassDocument {
+            agent: "codex".to_string(),
+            workspace: None,
+            workspace_original: None,
+            source_path: "session.jsonl".to_string(),
+            msg_idx: 0,
+            created_at: None,
+            title: title.map(str::to_string),
+            content: content.to_string(),
+            source_id: "source".to_string(),
+            origin_kind: "session".to_string(),
+            origin_host: None,
+            conversation_id: None,
+        };
+
+        let ascii = build_cass_tantivy_document(
+            fields,
+            &doc(Some("release notes"), "plain English and code symbols"),
+        );
+        assert_eq!(ascii.get_all(fields.title_zh_words).count(), 0);
+        assert_eq!(ascii.get_all(fields.content_zh_words).count(), 0);
+
+        let cjk = build_cass_tantivy_document(fields, &doc(Some("社会分歧"), "民主支持和中国经验"));
+        assert_eq!(cjk.get_all(fields.title_zh_words).count(), 1);
+        assert_eq!(cjk.get_all(fields.content_zh_words).count(), 1);
     }
 
     #[test]
